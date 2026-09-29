@@ -108,3 +108,49 @@ sqlite3 "$HOME\.cc-switch\cc-switch.db" "SELECT model, SUM(input_tokens), SUM(ou
 
 两侧应按"当前累计值 = CC Switch 累计写入增量"相等（首次 --reset-baseline 后即相等；
 若中间发生过计数器重置，以 Hermes 侧为准并重跑 --reset-baseline）。
+
+## F. Windows 中文控制台下的编码问题
+
+### F1. 脚本输出乱码
+
+控制台默认 GBK/cp936，脚本输出 UTF-8 中文时显示为乱码。**不影响数据正确性**，
+只影响显示。要正确显示：
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"   # 仅影响本次会话
+python scripts\hermes_usage_sync.py --verbose
+```
+
+若要在脚本内部也保证，运行时带上 `python -X utf8 scripts\hermes_usage_sync.py`。
+
+### F2. 自建测试时 `r.stdout` 变成 `None`
+
+如果你的测试用 `subprocess.run(..., text=True)` 跑本脚本，且脚本带 `--verbose`，
+在非 UTF-8 locale 上会抛 `UnicodeDecodeError`（发生在读取器线程里），
+`r.stdout` 变 `None`，断言随之报出难以定位的 `TypeError`。
+**两侧都要对齐编码**，参考 `tests/test_hermes_sync.py` 里的 `run_sync()`：
+
+```python
+env["PYTHONIOENCODING"] = "utf-8"
+subprocess.run(cmd, capture_output=True, text=True,
+               encoding="utf-8", errors="replace", env=env)
+```
+
+### F3. 访问 GitHub 超时（国内网络常见）
+
+`github.com` 常连不上，但 `api.github.com` 往往正常。若 git/gh/gh-capi 类工具卡住：
+
+```powershell
+# 先探测
+curl.exe -s -o NUL -w "%{http_code} %{time_total}s" --max-time 15 https://github.com
+curl.exe -s -o NUL -w "%{http_code} %{time_total}s" --max-time 15 https://api.github.com
+
+# 若前者超时、后者正常，给命令行走代理
+$env:HTTPS_PROXY = "http://127.0.0.1:<你的代理端口>"
+$env:HTTP_PROXY  = "http://127.0.0.1:<你的代理端口>"
+```
+
+常见本地代理端口：clash 系 7890 / 7897，v2ray 系 10809 / 1080。
+**端口以你自己代理软件的实际配置为准**，先用
+`Get-NetTCPConnection -State Listen` 确认。
+注意：浏览器能用不代表命令行能用，代理环境变量只对命令行进程生效。
