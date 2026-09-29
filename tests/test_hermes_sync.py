@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """hermes_usage_sync 单元测试：用临时 fixture DB 验证 delta 语义与容错。"""
 import os
 import shutil
@@ -59,8 +59,19 @@ def add_usage(conn, sid, model, task, calls, i, o, cr, cw, est, act, status, see
 def run_sync(tmp, cc_db, state_db, extra=()):
     env = dict(os.environ)
     env["LOCALAPPDATA"] = tmp
+    # 强制子进程以 UTF-8 输出：本脚本的 --verbose 会打印中文，而 Windows 的
+    # 默认 locale 可能是 GBK/cp936。若不在两侧对齐，subprocess 的文本解码会在
+    # 读取器线程里抛 UnicodeDecodeError，r.stdout 变成 None，断言随之崩溃。
+    env["PYTHONIOENCODING"] = "utf-8"
     cmd = [sys.executable, SCRIPT, "--cc-db", cc_db, "--state-db", state_db, *extra]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
     return r
 
 
@@ -84,7 +95,7 @@ def test_baseline_and_delta():
         st = os.path.join(tmp, "state.db")
 
         r = run_sync(tmp, cc, st)
-        assert r.returncode == 0, r.stderr
+        assert r.returncode == 0, (r.stderr or r.stdout)
         assert totals(cc) == (1, 100, 10), totals(cc)
 
         # cumulative 增长：再同步应只写增量
@@ -92,7 +103,7 @@ def test_baseline_and_delta():
         add_usage(h, "s1", "m1", "", 8, 260, 30, 120, 0, 0.02, 0.02, "actual", 2000.0)
         h.commit(); h.close()
         r = run_sync(tmp, cc, st)
-        assert r.returncode == 0, r.stderr
+        assert r.returncode == 0, (r.stderr or r.stdout)
         assert totals(cc) == (2, 260, 30), totals(cc)  # 100+160, 10+20
 
         # 第三次无变化：0 写入
@@ -125,7 +136,9 @@ def test_counter_reset():
         add_usage(h, "s1", "m1", "", 2, 30, 5, 0, 0, 0, 0, "", 2000.0)
         h.commit(); h.close()
         r = run_sync(tmp, cc, st, ("--verbose",))
-        assert "计数器重置" in r.stdout, r.stdout
+        assert r.returncode == 0, (r.stderr or r.stdout)
+        # 该断言依赖 --verbose 的中文输出，故要求上面显式对齐了编码
+        assert "计数器重置" in (r.stdout or ""), repr(r.stdout)
         assert totals(cc)[0] == 2, totals(cc)
         print("PASS counter_reset")
     finally:
@@ -144,7 +157,7 @@ def test_pricing_fallback():
         c.commit(); c.close()
         st = os.path.join(tmp, "state.db")
         r = run_sync(tmp, cc, st)
-        assert r.returncode == 0, r.stderr
+        assert r.returncode == 0, (r.stderr or r.stdout)
         c = sqlite3.connect(cc)
         cost = c.execute("SELECT total_cost_usd FROM proxy_request_logs"
                          " WHERE data_source='hermes_session'").fetchone()[0]
