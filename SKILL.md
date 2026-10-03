@@ -1,4 +1,4 @@
-﻿---
+---
 name: cc-switch-hermes-usage
 description: 在 CC Switch 使用统计页面持续维护 Hermes Agent 的 token 用量统计。封装健康检查、Hermes state.db 数据获取、增量（delta）同步、成本兜底计算与验证逻辑，CC Switch 侧零改动。当用户提到"Hermes 用量统计"、"Hermes token 同步"、"CC Switch 使用统计 Hermes"、"hermes_session 来源"时使用。
 license: MIT
@@ -30,39 +30,39 @@ CC Switch 3.20.4 发布版前端不含 Hermes 按钮（`KNOWN_APP_TYPES` 无 her
 
 | 项 | 值 |
 |---|---|
-| 上游源码 | <https://github.com/farion1231/cc-switch>（tag/版本 3.20.4） |
+| 源码 | `D:\security-research\projects\cc-switch`（main = 3.20.4） |
 | 改动 | `src/types/usage.ts`（AppType + KNOWN_APP_TYPES 加 hermes）、`UsageDashboard.tsx`（APP_FILTER_ICON）、`UsageHero.tsx`（TITLE_THEMES 配色）、4 个 i18n locale 加 `usage.appFilter.hermes` |
 | 未改动 | 后端 Rust（3.20.4 原生已支持 `app_type='hermes'` 聚合查询，数据仍由本 skill 同步写入） |
-| 产物 | `src-tauri/target/release/cc-switch.exe`（需你自行替换安装目录中的 `cc-switch.exe`，并自行备份原件） |
-| 构建环境 | Rust **1.95**（仓库 `rust-toolchain.toml` 固定）、MSVC 2022 Build Tools、pnpm |
-
-> ⚠️ 这些改动**只在你本地的 CC Switch 副本里**，本仓库不包含、也不分发 CC Switch 的源码或二进制。
-> 四处改动的精确内容见 `references/cc-switch-frontend-patch.md`（含验证命令）。
+| 产物 | `src-tauri\target\release\cc-switch.exe` → 安装到 `D:\ai\cc-switch.exe` |
+| 备份 | `D:\ai\cc-switch.exe.bak-3.20.4-original` |
+| 构建环境 | Rust **1.95**（仓库 `rust-toolchain.toml` 固定，需 USTC 镜像 `RUSTUP_DIST_SERVER`）、MSVC 2022 BuildTools、pnpm |
 
 复现构建（注意国内网络）：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-# 国内网络必设，否则拉取 Rust 1.95 工具链会长时间挂起（卡在官方源）
-$env:RUSTUP_DIST_SERVER   = "https://mirrors.ustc.edu.cn/rust-static"
-$env:RUSTUP_UPDATE_ROOT  = "https://mirrors.ustc.edu.cn/rust-static/rustup"
-
-git clone --depth 1 --branch v3.20.4 https://github.com/farion1231/cc-switch.git
-cd cc-switch
+$env:RUSTUP_DIST_SERVER = "https://mirrors.ustc.edu.cn/rust-static"   # 关键：否则拉 1.95 工具链会挂起
+$env:RUSTUP_UPDATE_ROOT = "https://mirrors.ustc.edu.cn/rust-static/rustup"
+cd D:\security-research\projects\cc-switch
 pnpm install
-pnpm tauri build --no-bundle     # 产物 src-tauri/target/release/cc-switch.exe
+pnpm tauri build --no-bundle     # 产物 src-tauri\target\release\cc-switch.exe
 ```
-
-其中 4 处前端改动的精确内容见 `references/cc-switch-frontend-patch.md`（含 `pnpm typecheck` 验证命令）。
 
 > 未移植 PR #6120 的 `session_usage_hermes.rs`（原生 Rust 同步 + 残差对账）。原因：涉及 6+ 文件、上千 hunks，
 > 而数据链路已由本 skill 打通且验证通过。合入后可将本 skill 降级为"仅验证"。
 
+## v2（2026-10-03）
+
+七项改动，全部由真机实测驱动：内容寻址幂等键、只读加固（query_only）、
+`created_at` 改用真实消息时刻、不伪造 status_code、可选消费插件账本喂真实耗时、
+`--repair-config` 清理合成 provider 污染、辅助调用行不套用主循环耗时。
+新增 `--report` / `--repair-config`，退出码 41 = config 污染。
+测试 22 + 4 例全绿；性能 v1 151.2ms → v2 147.3ms。
+**细节与 A/B 数据见 `references/v2-bench-ab.md`。**
 ## 快速使用
 
 ```powershell
-# 本 skill 的安装位置（opencode 从这里读取）
-$sk = "$env:USERPROFILE\.config\opencode\skills\cc-switch-hermes-usage"
+$sk = "C:\Users\zyq20\.config\opencode\skills\reverse-skill\skills\cc-switch-hermes-usage"
 
 # 1. 健康检查（不写入）
 python $sk\scripts\hermes_usage_sync.py --check
@@ -115,7 +115,8 @@ current <  prev        → 计数器被重置/重建 → 以当前值为新基�
 
 ### 3. 幂等与安全
 
-- `request_id = hermes:{profile}:{session}:{model}:{task}:{last_seen_ms}` + `INSERT OR IGNORE`
+- `request_id = hermes:{profile}:{session}:{model}:{task}@c{api_calls}:{est}:{act}`
+  （v2 改为内容寻址：不再依赖会抖动的 `last_seen_ms`，崩溃重跑不会双计）+ `INSERT OR IGNORE`
 - Hermes DB 只读方式打开（`mode=ro`），避免与 Hermes 运行时的 WAL 冲突
 - `--reset-baseline` 是唯一会删除数据的操作，需显式确认
 

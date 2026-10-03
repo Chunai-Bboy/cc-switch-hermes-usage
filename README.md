@@ -127,16 +127,53 @@ Register-ScheduledTask -TaskName "HermesUsageSync" -Action $action -Trigger $tri
    `DELETE FROM proxy_request_logs WHERE data_source='hermes_session';`
    配合 `--reset-baseline` 重建基线——但请先理解代价。
 
-## 已知局限 · 补充线索
+## 之前留着疑问的，现在都有定论（2026-10-03 实测）
 
-如果需要**真正的逐次请求**数据，Hermes 数据库里可能存在这条路（截至 2026-09-29
-尚未验证）：
+### 1. `messages.token_count` 永远是 NULL —— 路径已死，别再留期待
 
-- `messages` 表带 `timestamp`、`token_count`、`finish_reason` 字段，是**请求级**的
-- 但实测样本中 `token_count` 为空，需要先确认当前 Hermes 版本是否稳定填充该字段
-- 若可用，即可按真实请求逐条写入，彻底解决局限 1 和 2
+实测 `messages` 共 199 行，assistant / tool / user 全类别，含所有 `finish_reason`
+与 `tool_name`（terminal 18、vision_analyze 4、browser_exec 3、patch 2、skill_view 2…），
+`token_count` 非 NULL 的行数 = **0**。schema_version = 30。
 
-这条线索也适合反馈给 CC Switch 官方（见 `references/` 下的讨论要点）。
+### 2. issue #5088 说的 `messages._usage` 字段不存在 —— 那个说法本身有误
+
+`messages` 共 26 列，**没有任何一列叫 `_usage`**。
+`vision_analyze` 的实际 content 是"Image loaded into your context — you can see it natively now"，
+说明它早就不再单独发 API 请求，图片直接进原生上下文，所以压根没有可上报的独立 token 记录。
+
+### 3. `messages.timestamp` 不是请求发出时刻 —— 但仍然有用作时间轴
+
+7 对逐条配对实测：`messages.timestamp[i] - 插件 started_at[i]` ≈ 插件 `duration_ms[i]`
+
+| # | 插件 started | 插件 duration | messages.timestamp | 差值 |
+|---|---|---|---|---|
+| 1 | 11:52:24 | 8708ms | 11:52:33 | 8720ms |
+| 2 | 11:52:34 | 5378ms | 11:52:40 | 5392ms |
+| 3 | 11:52:41 | 5751ms | 11:52:47 | 5765ms |
+| 4 | 11:52:48 | 5106ms | 11:52:53 | 5125ms |
+| 5 | 11:52:57 | 4815ms | 11:53:02 | 4828ms |
+| 6 | 11:56:04 | 6240ms | 11:56:10 | 6255ms |
+| 7 | 11:56:13 | 4862ms | 11:56:18 | 4873ms |
+
+差值逐条等于耗时 ⇒ 它是**响应到达时刻**。刻度真实且唯一（7/7 不重复、0 NULL），
+可作时间轴，但**拿不到耗时**。
+
+### 4. `background_review` 这类行会把多次调用压成一个时刻
+
+实测 `first_seen == last_seen == 1790969381.7378309`（7 位小数完全相同），而 `api_call_count = 8`。
+子 agent 循环跑完一次性写库。**任何导入器都无法还原成 8 个独立请求。**
+
+### 5. `reasoning_tokens` CC Switch 存不下
+
+`proxy_request_logs` 27 列，**全库 0 个 `reasoning` 列**（逐表扫过）。
+v2 只写入自己的 sidecar `dimension_totals`，并在 `--report` 的 `sidecar_unmapped` 里明确报告。
+要进仪表盘必须上游加列，那会破坏"CC Switch 侧零改动"。
+
+### 6. 辅助任务占 28.6%，聚合源全覆盖而 hook 覆盖不了
+
+实测 133 次调用：main 95 / approval 28 / background_review 8 / title_generation 2。
+`messages` 里正好 95 行 assistant（= main 调用数），**38 次辅助调用在 `messages` 里完全不存在**。
+这是 `post_api_request` hook 结构性够不到的部分。
 
 ## 为什么不直接用官方 PR #6120
 
@@ -218,9 +255,10 @@ The token **totals are accurate**. These are not, and are structural:
    Hermes garbage-collects expired sessions. Intentional: usage history shouldn't
    vanish because the source cleaned up.
 
-A possible route to real per-request data: Hermes' `messages` table has `timestamp`,
-`token_count` and `finish_reason` (request-level). Not yet verified whether the
-current Hermes version populates `token_count`.
+Resolved 2026-10-03: `messages.token_count` is NULL in 199/199 rows - dead end.
+`messages.timestamp` is the response-arrival moment (verified by 7 paired comparisons
+against plugin hook timings): usable as a time axis, not as latency. Real per-request
+data requires the `post_api_request` hook. See `references/v2-bench-ab.md`.
 
 ### Install & run
 
@@ -241,7 +279,9 @@ least once, and Python 3.8+ (standard library only).
 ### Tests
 
 ```powershell
-python tests\test_hermes_sync.py
+python tests\test_bugfix_regressions.py   # 17 例
+python tests\test_hermes_sync_v2.py       # 29 例
+python tests\test_hermes_sync.py          # 4 例 v1 回归
 ```
 
 ### Credits
@@ -255,3 +295,80 @@ Not affiliated with the CC Switch project.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## v2 changelog（2026-10-03）
+
+七项实测驱动的改动：内容寻址幂等键 / 只读加固 / 真实消息时刻 / 不伪造 status_code /
+可选消费插件账本 / `--repair-config` 修 config 污染 / 辅助行不套主循环耗时。
+
+新增：`--report`（聚合 vs 逐请求 JSON 报告）、`--repair-config`，退出码 41。
+测试：`test_hermes_sync_v2.py` 22 例 + `test_hermes_sync.py` 4 例回归。
+性能：v1 151.2ms → v2 147.3ms（12 轮稳态中位）。
+详见 `references/v2-bench-ab.md`。
+
+
+---
+
+## v2.1 changelog（2026-10-03，32 分钟长任务实测后）
+
+一次 32 分钟、43 次调用的真实 Hermes 会话（session `20261003_144834_1d260f`）挖出三个 bug：两个在同步脚本里，一个是我自己引入后又当场揪出来的。全部有回归测试锁定。
+
+### BUG1 快照键漏了 3 列，会重复计数
+
+`session_model_usage` 的主键是 **6 列**：
+
+```sql
+PRIMARY KEY (session_id, model, billing_provider,
+                billing_base_url, billing_mode, task)
+```
+
+v2 的快照键只用了 4 列 `(profile, session, model, task)`。那个会话里有**两条**`task='approval'`，靠 `billing_base_url` 区分（`''` vs `https://opencode.ai/zen/v1/`），于是被并成一条序列。真实回放三轮：
+
+```第1轮基线      5 条  calls=43   in=61276
+第2轮前进      3 条  calls=21   in=20582   <- 3 条而不是 2 条
+第3轮应为空    1 条  calls=1    in=997     <- 本该是空的，却冒出重复行
+合计               calls=65   in=82855   差 +2 次调用 / +1994 input```
+
+修法：快照键与 `request_id` 都改用表本身的完整主键。修完同一份数据：
+
+```第3轮应为空    0 条
+合计               calls=63   in=80861   与真值完全一致```
+
+**注意 SQLite 在普通表上会为 PRIMARY KEY 建隐式唯一索引**，所以 6 列本身就够防重复，不需要额外字段。
+
+### 自己引入又揪出来的坑：first_seen 不能进键
+
+第一版修法在键尾加了 `first_seen` 兜底。v1 回归测试立刻报 `360/40 != 260/30`——fixture 把 `first_seen` 从 1000 改成 2000（模拟长会话），老序列就变成新序列，整行重新基线，多写 100 input / 10 output。
+
+**主键之外的任何可变列进键都会重复计数。** 已移除，并加测试锁死。
+
+### BUG2 耗时用全会话中位数，语义是错的
+
+v2 把「全会话所有事件的耗时中位数」填进**每一个**同步窗口行。那个会话窗口行显示`latency=59805ms`，而该会话真实耗时区间是 `14.2s ~ 198.2s`。行代表一个时间窗口，填的却是整段会话——数字看着合理，含义完全对不上。
+
+修法：快照存住上一次的 `last_seen`，用 `(prev_last_seen, cur_last_seen]` 这个真实时间窗去归属插件事件，只有落在窗里的才参与中位数。首次基线没有「上一次」，返回 `None` -> 写 0，**宁可留空也不编**。
+
+副作用（正确的）：基线行的 `latency_ms` 现在恒为 0，耗时从第二次同步开始才出现。
+
+### 顺带修正的两个认知
+
+```| 之前以为 | 实测 |
+|---|---|
+| 插件只覆盖主循环 | 也覆盖 `background_review`（子 agent 走同一条 conversation_loop） |
+| 插件漏掉 31% 调用 | 漏的是 `title_generation` + `approval`（走 auxiliary_client，无此 hook） |```
+
+### 迁移
+
+键格式变了，老 `request_id` 不会被去重。升级必须重建：
+
+```python scripts\hermes_usage_sync.py --reset-baseline```
+
+删掉 CC Switch 里的 `hermes_session` 行和本地快照，再从 `state.db` 全量重扫。源库是累计完整的，重建结果与真值逐项一致。重建前务必备份两个 db。
+
+### 测试
+
+```test_bugfix_regressions.py   17 例  <- 新增，锁住上面三个 bug
+test_hermes_sync_v2.py       29 例
+test_hermes_sync.py           4 例  v1 回归```
