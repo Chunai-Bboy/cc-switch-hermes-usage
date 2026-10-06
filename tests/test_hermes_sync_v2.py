@@ -113,6 +113,7 @@ class Base(unittest.TestCase):
             rows = self.snap_rows()
             deltas, snaps = hus.compute_deltas(rows, st)
             with db(self.ccdb) as cc:
+                hus.ensure_provider(cc)
                 n = hus.write_deltas(cc, deltas, hus.latency_index(events))
             hus.save_snapshots(st, snaps)
             hus.save_events(st, events)
@@ -416,13 +417,16 @@ class TestReport(Base):
 
 # ==================================================================== verify 契约
 class TestVerifyScript(Base):
-    """锁住 verify 的核心契约：它必须验「对不对」，而不只是「有没有」。"""
+    """锁住 verify 的核心契约（v2.2 基准）：
+    CC == 账本 必须成立；账本领先实时真值 = 上游丢历史（WARN 不是 FAIL）；
+    账本落后实时真值 = 漏同步（FAIL）。真值路径用 --hermes-db 隔离到沙箱。"""
 
     def _run_verify(self):
         sp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "..", "scripts", "verify_hermes_usage.py")
         return subprocess.run([sys.executable, "-X", "utf8", sp,
-                               "--cc-db", str(self.ccdb), "--state-db", str(self.sdb)],
+                               "--cc-db", str(self.ccdb), "--state-db", str(self.sdb),
+                               "--hermes-home", str(self.dir)],
                               capture_output=True, text=True, encoding="utf-8")
 
     def test_verify_outputs_reconciliation_table(self):
@@ -430,7 +434,51 @@ class TestVerifyScript(Base):
         self.sync()
         r = self._run_verify()
         self.assertIn("input tokens", r.stdout, "必须输出三方对账表")
-        self.assertIn("真值", r.stdout)
+        self.assertIn("实时真值", r.stdout)
+        self.assertIn("同步账本", r.stdout)
+
+    def test_verify_all_aligned_no_fail(self):
+        """账本==CC==真值 时 verify 必须 0 FAIL。"""
+        self.add_usage("s1", "m1", "", 5, 1000, 200, 500)
+        self.add_usage("s1", "m1", "approval", 3, 40, 6)
+        self.sync()
+        r = self._run_verify()
+        self.assertNotIn("[FAIL]", r.stdout, "全对齐时不应有 FAIL 检查项:\n" + r.stdout)
+        self.assertEqual(r.returncode, 0)
+
+    def test_verify_upstream_lost_is_warn_not_fail(self):
+        """同步后上游删会话：账本领先真值必须 WARN，绝不 FAIL，
+        且必须点名是哪个会话丢了（v2.2 修正的核心场景）。"""
+        self.add_usage("s1", "m1", "", 5, 1000, 200, 500)
+        self.add_usage("s2", "m1", "", 4, 888, 100)
+        self.sync()
+        self.set_usage("DELETE FROM session_model_usage WHERE session_id='s2'")
+        r = self._run_verify()
+        self.assertIn("上游丢历史", r.stdout)
+        self.assertIn("s2", r.stdout, "必须点名丢失的会话")
+        self.assertNotIn("[FAIL]", r.stdout, "上游丢历史不能判 FAIL 检查项:\n" + r.stdout)
+        self.assertEqual(r.returncode, 0, "WARN-only 必须退出 0")
+
+    def test_verify_unsynced_delta_is_fail(self):
+        """真值前进但没再 sync：账本落后真值必须 FAIL（这才是该报警的情形）。"""
+        self.add_usage("s1", "m1", "", 5, 1000, 200, 500)
+        self.sync()
+        self.set_usage("UPDATE session_model_usage SET api_call_count=6,"
+                       " input_tokens=1500, output_tokens=300")
+        r = self._run_verify()
+        self.assertIn("FAIL", r.stdout)
+        self.assertIn("有增量未同步", r.stdout)
+        self.assertEqual(r.returncode, 1)
+
+    def test_verify_ledger_cc_mismatch_is_fail(self):
+        """账本与 CC 不等（同步器半写入/算错）必须 FAIL，哪怕两边都不等于真值。"""
+        self.add_usage("s1", "m1", "", 5, 1000, 200, 500)
+        self.sync()
+        with db(self.ccdb) as c:
+            c.execute("UPDATE proxy_request_logs SET input_tokens = input_tokens + 7")
+        r = self._run_verify()
+        self.assertIn("账本≠CC", r.stdout)
+        self.assertEqual(r.returncode, 1)
 
     def test_verify_latency_pollution_is_flagged(self):
         """辅助任务行若带了 latency，verify 必须报出来（v2 曾踩过这个坑）。"""

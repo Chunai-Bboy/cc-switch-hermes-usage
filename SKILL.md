@@ -138,8 +138,14 @@ current <  prev        → 计数器被重置/重建 → 以当前值为新基�
 
 ## 验证与排障
 
-完整验证：`python $sk\scripts\verify_hermes_usage.py`，应看到：
-provider 已注册、记录数 > 0、模型统计表、UI 查看路径提示。
+完整验证：`python $sk\scripts\verify_hermes_usage.py`，应看到三方对账表
+（实时真值 vs 同步账本 vs CC Switch）。基准关系（v2.2）：
+**CC Switch 必须等于同步账本**（这是同步器自己的账，必须分毫不差）；
+**账本 ≥ 实时真值 是常态**——Hermes 会删老会话聚合行（升级实测一次删 10 个、
+input 差 882,626），历史已安全存于账本/CC，此时只 WARN「上游丢历史」，不是 FAIL。
+绝不允许用 `--reset-baseline` 删真实历史来把检查做绿。
+其余检查：provider 已注册、记录数 > 0、latency 归属、config 污染、只读保护。
+测试隔离可用 `--hermes-home <目录>` 把真值/插件/config 检查全指向沙箱。
 
 常见问题速查：
 
@@ -148,7 +154,8 @@ provider 已注册、记录数 > 0、模型统计表、UI 查看路径提示。
 | usage 页下拉没有 Hermes Agent | 日期范围不含数据（默认"当天"） | 日期切到"近30天"或自定义覆盖数据日期 |
 | Hero 总数不含 hermes | App 筛选被设为具体 app 且不是全部 | App 筛选保持"全部" |
 | ERROR[30] 写入失败 | CC Switch 正在写 DB（SQLite 锁） | 脚本已用 timeout=10 + BEGIN IMMEDIATE；仍失败则退出 CC Switch 重试 |
-| 数字比 Hermes 侧大 | 旧版全量脚本双计 | `--reset-baseline` 重建 |
+| 数字比 Hermes 侧大一点（verify 判 WARN 上游丢历史） | Hermes 清理/升级删了老会话聚合行，账本/CC 保留历史 | **正常，不动**。这是有意取舍：历史不因源端清档消失 |
+| 数字比 Hermes 侧大约 2 倍或按轮翻倍 | 旧版全量脚本与新 delta 双计 | 仅此时才用 `--reset-baseline`（会删 CC 的 hermes 历史，先备份） |
 | 数字比 Hermes 小 | 计数器重置被当基线，中间量丢失 | 已知限制，需 Hermes 侧时间戳事件才能精确归因（同 PR #6120 设计结论） |
 
 ## 迭代路线（后续可持续演进）

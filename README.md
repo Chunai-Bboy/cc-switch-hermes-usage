@@ -122,10 +122,16 @@ Register-ScheduledTask -TaskName "HermesUsageSync" -Action $action -Trigger $tri
    同步删除 CC Switch 里的历史记录。因此 CC Switch 的 Hermes 累计值通常**大于**
    Hermes 当前仍保留的值。实测样本：CC Switch 侧 85,398 input tokens，
    Hermes 侧剩余 13,201（差额是被 Hermes 清理掉的会话）。
+   升级 Hermes 时这类清理尤其集中——0.21.2→0.21.5 一次删掉 10 个老会话，
+   CC Switch 与本地账本各自比 Hermes 实时真值多 882,626 input。
    这是**有意为之**：用量历史不应该因为源端清档而凭空消失。
+   `verify_hermes_usage.py` 对这种情况判 **WARN「上游丢历史」并点名丢失会话**，
+   不判 FAIL——对账基准是「CC Switch == 本地账本（snapshots）」，两者必须分毫不差；
+   实时真值只是参考量，允许账本领先它。
    若你确实需要两边严格对齐，可手动执行
    `DELETE FROM proxy_request_logs WHERE data_source='hermes_session';`
-   配合 `--reset-baseline` 重建基线——但请先理解代价。
+   配合 `--reset-baseline` 重建基线——但这会**永久删掉已同步的真实历史**，
+   除非确凿是双计（见 troubleshooting B2），否则别用它换绿勾。
 
 ## 之前留着疑问的，现在都有定论（2026-10-03 实测）
 
