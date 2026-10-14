@@ -385,6 +385,39 @@ def series_key(r):
     ])
 
 
+def orphan_snapshot_keys(rows, state_conn, cc_conn, verbose=False):
+    """快照存在、但 CC 侧整个序列一行都没有的孤儿（漏写自愈用）。
+
+    判据必须是**序列级**（profile|session|model|task），不能是单个
+    request_id：id 里编了 api_calls 与 cost，同序列每前进一次就换新 id，
+    按 id 判会把每个已正确导入的历史行都误判成孤儿，把累计值重写一遍
+    （实测 260 -> 360）。只有整个序列在 CC 里 0 行，才是真漏写。
+
+    幂等由调用方保证：补写走 baseline，request_id 与首次一致，
+    INSERT OR IGNORE 不会双计。
+    """
+    have = cc_conn.execute(
+        "SELECT request_id FROM proxy_request_logs WHERE data_source=?",
+        (DATA_SOURCE,)).fetchall()
+    if not have:
+        return []
+    # CC 侧出现过的序列集合
+    live_series = set()
+    for (rid,) in have:
+        body = rid[len("hermes:"):] if rid.startswith("hermes:") else rid
+        p = body.split(":")
+        if len(p) >= 4:
+            live_series.add((p[0], p[1], p[2], p[3]))
+    orphans = []
+    for r in rows:
+        k = (r["profile"], r["session_id"], r["model"], r["task"])
+        if k not in live_series:
+            orphans.append(r)
+            if verbose:
+                print("[orphan] 补写基线: %s" % series_key(r))
+    return orphans
+
+
 def compute_deltas(rows, state_conn, verbose=False):
     deltas, new_snaps = [], []
     resets = 0
@@ -762,6 +795,18 @@ def main():
         state.execute("DELETE FROM snapshots")
         cc.commit(); state.commit()
 
+    orphans = orphan_snapshot_keys(rows, state, cc, args.verbose)
+    if orphans:
+        # 孤儿序列：CC 侧缺失，按当前累计值补一条基线。
+        # 做法是把它们从快照里"抹掉"再算 delta，compute_deltas 便会视作
+        # prev is None -> baseline，从而产出完整累计值的一份增量。
+        orph_keys = {series_key(r) for r in orphans}
+        for k in orph_keys:
+            state.execute("DELETE FROM snapshots WHERE key=?", (k,))
+        state.commit()
+        print("[heal] 发现 %d 条孤儿快照（账本有、CC 无），按基线补写"
+              % len(orph_keys))
+        rows = rows + orphans
     deltas, snaps = compute_deltas(rows, state, args.verbose)
     t0 = time.perf_counter()
     try:

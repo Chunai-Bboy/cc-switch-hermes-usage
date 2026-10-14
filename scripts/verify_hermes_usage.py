@@ -359,29 +359,46 @@ def main():
         summary["latency_rows"] = a_lat
 
         # ------------------------------------------------- 6. 插件交叉验证
+        # 双判：文件在 ≠ 表在。用户可能已卸载插件（只留空库文件），
+        # 老代码只判 os.path.exists 会直接查崩（no such table: request_events）。
         if os.path.exists(plugin_ledger):
             with closing(ro(plugin_ledger)) as lg:
-                ev = lg.execute("SELECT COUNT(*) FROM request_events").fetchone()[0]
-                kinds = dict(lg.execute(
-                    "SELECT COALESCE(kind,'?'), COUNT(*) FROM request_events GROUP BY 1"))
-                good = lg.execute("SELECT COUNT(*) FROM request_events"
-                                 " WHERE kind='main' AND usage_available=1").fetchone()[0]
-                agg_ev = lg.execute(
-                    "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),"
-                    " COALESCE(SUM(cache_read_tokens),0)"
-                    " FROM request_events WHERE kind='main' AND usage_available=1").fetchone()
-            c.ok("插件账本", "%d 条事件（main %d / 其他 %d）"
-                 % (ev, kinds.get("main", 0), ev - kinds.get("main", 0)))
-            if kinds.get("aux", 0) == 0:
-                c.warn("插件 aux 覆盖",
-                       "0 条 aux —— 本窗口可能确无辅助调用，或 Hermes 版本未含 "
-                       "post_auxiliary_call（该钩子自 0.21.5 起提供）。占真值 %d/%d = %.0f%%"
-                       % (truth.get("aux_calls", 0), truth.get("calls", 0),
-                          100.0 * truth.get("aux_calls", 0) / max(1, truth.get("calls", 0))))
-            summary["plugin"] = {"rows": ev, "kinds": kinds,
-                                 "main_usable": good,
-                                 "main_input": agg_ev[0], "main_output": agg_ev[1],
-                                 "main_cache_read": agg_ev[2]}
+                has_ev = lg.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table'"
+                    " AND name='request_events'").fetchone()
+                if has_ev:
+                    ev = lg.execute(
+                        "SELECT COUNT(*) FROM request_events").fetchone()[0]
+                    kinds = dict(lg.execute(
+                        "SELECT COALESCE(kind,'?'), COUNT(*)"
+                        " FROM request_events GROUP BY 1"))
+                    good = lg.execute("SELECT COUNT(*) FROM request_events"
+                                      " WHERE kind='main'"
+                                      " AND usage_available=1").fetchone()[0]
+                    agg_ev = lg.execute(
+                        "SELECT COALESCE(SUM(input_tokens),0),"
+                        " COALESCE(SUM(output_tokens),0),"
+                        " COALESCE(SUM(cache_read_tokens),0)"
+                        " FROM request_events"
+                        " WHERE kind='main' AND usage_available=1").fetchone()
+                    c.ok("插件账本", "%d 条事件（main %d / 其他 %d）"
+                         % (ev, kinds.get("main", 0), ev - kinds.get("main", 0)))
+                    if kinds.get("aux", 0) == 0:
+                        c.warn("插件 aux 覆盖",
+                               "0 条 aux —— 本窗口可能确无辅助调用，或 Hermes 版本未含 "
+                               "post_auxiliary_call（该钩子自 0.21.5 起提供）。"
+                               "占真值 %d/%d = %.0f%%"
+                               % (truth.get("aux_calls", 0),
+                                  truth.get("calls", 0),
+                                  100.0 * truth.get("aux_calls", 0)
+                                  / max(1, truth.get("calls", 0))))
+                    summary["plugin"] = {
+                        "rows": ev, "kinds": kinds, "main_usable": good,
+                        "main_input": agg_ev[0], "main_output": agg_ev[1],
+                        "main_cache_read": agg_ev[2]}
+                else:
+                    c.warn("插件账本",
+                           "库文件在但无 request_events 表（插件已卸载，属预期）")
         else:
             c.warn("插件账本", "未安装（逐请求事实不可得，属预期）")
 
