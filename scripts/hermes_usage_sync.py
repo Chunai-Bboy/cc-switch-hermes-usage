@@ -362,6 +362,60 @@ def read_plugin_events(verbose=False):
     return events
 
 
+def rebuild_rollups(cc_conn, verbose=False):
+    """按 CC Switch 自己的口径重算 hermes 的 usage_daily_rollups。
+
+    为什么必须做：CC Switch 仪表盘读 usage_daily_rollups，而它内置的
+    sync_session_usage 只覆盖它认识的 app（opencode/codex/gemini/...），
+    从不给 hermes 重算。我们只写明细的话，hermes 用量在仪表盘上永远显示为空
+    （实测：明细 111 行、rollup 仅 09-11 一行，差额整整 10 天）。
+
+    只动 app_type='hermes' 的行，绝不碰其它 app。INSERT OR REPLACE 幂等。
+    表不存在（老版本 CC Switch）时跳过并告警，不影响主同步流程。
+    返回写入行数。
+    """
+    have = cc_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='usage_daily_rollups'").fetchone()
+    if not have:
+        print("WARN: CC Switch 无 usage_daily_rollups 表（版本过旧），"
+              "跳过每日汇总重算；仪表盘可能不显示 hermes 用量")
+        return 0
+    rows = cc_conn.execute(
+        "SELECT date(created_at,'unixepoch','localtime') AS d,"
+        "       COALESCE(model,'?') AS model,"
+        "       COUNT(*),"
+        "       COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299"
+        "                           THEN 1 ELSE 0 END), 0),"
+        "       COALESCE(SUM(input_tokens), 0),"
+        "       COALESCE(SUM(output_tokens), 0),"
+        "       COALESCE(SUM(cache_read_tokens), 0),"
+        "       COALESCE(SUM(cache_creation_tokens), 0),"
+        "       COALESCE(SUM(CAST(total_cost_usd AS REAL)), 0),"
+        "       COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0)"
+        "  FROM proxy_request_logs"
+        " WHERE data_source = ?"
+        " GROUP BY d, model", (DATA_SOURCE,)).fetchall()
+
+    n = 0
+    for (d, model, cnt, ok, tin, tout, cr, cw, cost, lat) in rows:
+        cc_conn.execute(
+            "INSERT OR REPLACE INTO usage_daily_rollups"
+            " (date, app_type, provider_id, model, request_model, pricing_model,"
+            "  request_count, success_count, input_tokens, output_tokens,"
+            "  cache_read_tokens, cache_creation_tokens, total_cost_usd,"
+            "  avg_latency_ms, input_token_semantics)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (d, APP_TYPE, PROVIDER_ID, model, model, "",
+             cnt, ok, tin, tout, cr, cw,
+             "%.6f" % (cost or 0.0), int(lat or 0), 2))
+        n += 1
+
+    if verbose and n:
+        print("[rollup] 重算 hermes 每日汇总 %d 行" % n)
+    return n
+
+
 # ---------------------------------------------------------------- delta
 
 def series_key(r):
@@ -781,6 +835,7 @@ def main():
         state.close(); cc.close()
         return 0
 
+    rollup_n = 0
     if args.dry_run:
         prev = {r[0] for r in state.execute("SELECT key FROM snapshots")}
         new = {series_key(r) for r in rows} - prev
@@ -819,6 +874,9 @@ def main():
             save_events(state, events)
             save_extra_dimensions(state, rows, args.verbose)
             state.commit()
+        # 仪表盘读 usage_daily_rollups，而 CC Switch 从不给 hermes 重算它；
+        # 不在此处补，明细写得再对她也不显示（实测差过整整 10 天）。
+        rollup_n = rebuild_rollups(cc, args.verbose)
         cc.commit()
     except sqlite3.Error as e:
         cc.rollback(); state.rollback()
@@ -828,8 +886,8 @@ def main():
     elapsed = (time.perf_counter() - t0) * 1000
     state.close(); cc.close()
     print("OK 同步完成: 聚合增量 %d 条 (写入耗时 %.1fms), 累计快照 %d 条, "
-          "profile %d 个, 插件逐请求事件 %d 条已存 sidecar"
-          % (written, elapsed, len(rows), len(dbs), len(events)))
+          "profile %d 个, 插件逐请求事件 %d 条已存 sidecar, 每日汇总 %d 条"
+          % (written, elapsed, len(rows), len(dbs), len(events), rollup_n))
     if r4.code == 41:
         print("WARN: %s（用 --repair-config 清理）" % r4.msg)
     return 0
