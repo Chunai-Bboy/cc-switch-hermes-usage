@@ -83,6 +83,29 @@ python $sk\scripts\verify_hermes_usage.py
 python $sk\scripts\hermes_usage_sync.py --reset-baseline
 ```
 
+## 用量面板（不想翻 CC Switch 时用它）
+
+CC Switch 4.0.12 前端已 Rust 重写、本机无 cargo 无法改源码重编，所以另做了一个
+独立面板：同样的库、同样的口径，点 app 图标即看该 app 用量。
+
+```powershell
+node "$sk\scripts\hermes-usage-panel.js" 8799
+# 浏览器开 http://127.0.0.1:8799
+```
+
+- 顶部一排 app 图标（Claude/Codex/Gemini/Grok/OpenCode/**Hermes**/Pi/MCode），
+  每个图标下面直接标请求数和成本，点一下即切换
+- 卡片区：总请求数 / 真实消耗 Tokens / 缓存命中 / 总成本 / 活跃天数 / 模型数
+- 每日趋势柱状图、按模型表、最近 200 条明细
+- 只读 `~/.cc-switch/cc-switch.db`，15 秒自动刷新
+
+口径注意（与 CC Switch 对齐，实测踩过）：
+- **汇总**（图标栏/卡片）必须排除 `session_log / codex_session /
+  gemini_session / opencode_session` 这些 data_source，因为它们与 CC Switch
+  自己的 proxy 日志重复，不排除会把 opencode 从 121 次算成 242 次
+- **明细**照实显示全部行，不过滤——CC Switch 的请求日志也是这样
+  （早先版本两边都过滤，结果 opencode 详情直接变 0 条）
+
 ## 计划任务（持续同步）
 
 ```powershell
