@@ -7,6 +7,7 @@
 import contextlib
 import importlib.util
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -496,6 +497,134 @@ class TestVerifyScript(Base):
         r = self._run_verify()
         self.assertIn("sidecar", r.stdout, "必须报告 CC Switch 存不下的维度")
         self.assertIn("777", r.stdout)
+
+
+# ==================================================================== 归档回填
+class TestArchiveBackfill(Base):
+    """backfill_status_from_archive：用插件归档的真实 status/duration 覆盖
+    write_deltas 统一写的 200（聚合源证明不了 HTTP 状态）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.add_usage("s1", "m1", "", 5, 1000, 200, 500)
+        self.sync()
+        # 把归档目录指到空 tmp，避免测试读到真机归档
+        import tempfile
+        self._old = hus.ARCHIVE_DIR
+        self.tmp = tempfile.mkdtemp()
+        hus.ARCHIVE_DIR = self.tmp
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        hus.ARCHIVE_DIR = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cc(self):
+        with db(self.ccdb) as c:
+            return c.execute("SELECT status_code, latency_ms FROM"
+                             " proxy_request_logs WHERE"
+                             " data_source='hermes_session'").fetchall()
+
+    def test_no_archive_is_noop(self):
+        """没有归档时必须静默跳过，不能崩、不能改数。"""
+        with db(self.ccdb) as c:
+            n = hus.backfill_status_from_archive(c)
+        self.assertEqual(n, 0)
+        self.assertEqual(self._cc(), [(200, 0)])
+
+    def test_backfill_uses_real_status_and_median_latency(self):
+        """有归档时：错误码照实写，latency 取段内中位数。"""
+        # 造一个归档：同一序列 3 次调用，第 2 次 429，duration 100/300/500
+        arc = os.path.join(self.tmp, "ccswitch-usage-20260101-000000.sqlite")
+        with db(arc) as a:
+            a.execute("CREATE TABLE request_events ("
+                      " event_id TEXT PRIMARY KEY, kind TEXT, session_id TEXT,"
+                      " task_id TEXT, aux_task TEXT, model TEXT, provider TEXT,"
+                      " started_at_ms INTEGER, ended_at_ms INTEGER,"
+                      " duration_ms INTEGER, status TEXT, status_code INTEGER,"
+                      " usage_available INTEGER, input_tokens INTEGER,"
+                      " output_tokens INTEGER, cache_read_tokens INTEGER,"
+                      " cache_write_tokens INTEGER, reasoning_tokens INTEGER)")
+            for i, (st, code, dur) in enumerate(
+                    [("success", 200, 100), ("error", 429, 300),
+                     ("success", 200, 500)], start=1):
+                a.execute(
+                    "INSERT INTO request_events (event_id, kind, session_id,"
+                    " task_id, aux_task, model, provider, started_at_ms,"
+                    " ended_at_ms, duration_ms, status, status_code,"
+                    " usage_available, input_tokens, output_tokens,"
+                    " cache_read_tokens, cache_write_tokens, reasoning_tokens)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("main:s1:u:h:api:%d:%s:0" % (i, st), "main", "s1",
+                     "t", "", "m1", "p", 1000 * i, 1000 * i, dur, st,
+                     code, 1, 10, 1, 0, 0, 0))
+        with db(self.ccdb) as c:
+            n = hus.backfill_status_from_archive(c)
+        self.assertEqual(n, 1, "该序列只有一行累计行")
+        sc, lat = self._cc()[0]
+        self.assertEqual(sc, 429, "段内有错误就必须照实写，不能粉饰成 200")
+        self.assertEqual(lat, 300, "latency 取段内 duration 中位数")
+
+    def test_backfill_is_idempotent(self):
+        arc = os.path.join(self.tmp, "ccswitch-usage-20260101-000000.sqlite")
+        with db(arc) as a:
+            a.execute("CREATE TABLE request_events ("
+                      " event_id TEXT PRIMARY KEY, kind TEXT, session_id TEXT,"
+                      " task_id TEXT, aux_task TEXT, model TEXT, provider TEXT,"
+                      " started_at_ms INTEGER, ended_at_ms INTEGER,"
+                      " duration_ms INTEGER, status TEXT, status_code INTEGER,"
+                      " usage_available INTEGER, input_tokens INTEGER,"
+                      " output_tokens INTEGER, cache_read_tokens INTEGER,"
+                      " cache_write_tokens INTEGER, reasoning_tokens INTEGER)")
+            a.execute(
+                "INSERT INTO request_events (event_id, kind, session_id,"
+                " task_id, aux_task, model, provider, started_at_ms,"
+                " ended_at_ms, duration_ms, status, status_code,"
+                " usage_available, input_tokens, output_tokens,"
+                " cache_read_tokens, cache_write_tokens, reasoning_tokens)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("main:s1:u:h:api:1:success:0", "main", "s1", "t", "",
+                 "m1", "p", 1000, 1000, 700, "success", 200, 1, 10, 1,
+                 0, 0, 0))
+        with db(self.ccdb) as c:
+            hus.backfill_status_from_archive(c)
+            first = self._cc()
+            hus.backfill_status_from_archive(c)
+            second = self._cc()
+        self.assertEqual(first, second, "重复回填不得改变结果")
+
+
+# ==================================================================== 免费定价
+class TestFreeModelPricing(Base):
+    def test_free_models_get_explicit_zero_pricing(self):
+        """免费模型补显式 0 定价，语义从"未定价"变成"已定价且免费"。"""
+        with db(self.ccdb) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS model_pricing ("
+                      " model_id TEXT PRIMARY KEY, display_name TEXT,"
+                      " input_cost_per_million TEXT, output_cost_per_million TEXT,"
+                      " cache_read_cost_per_million TEXT,"
+                      " cache_creation_cost_per_million TEXT)")
+            c.execute("INSERT OR REPLACE INTO model_pricing VALUES"
+                      " ('longcat-2.5-preview-free','lc','0','0','0','0')")
+            n = hus.ensure_free_model_pricing(c)
+            self.assertGreater(n, 0)
+            for mid in ("space-bunny-free", "upstage/solar-pro4:free"):
+                r = c.execute("SELECT input_cost_per_million FROM model_pricing"
+                              " WHERE model_id=?", (mid,)).fetchone()
+                self.assertIsNotNone(r, mid + " 必须有定价行")
+                self.assertEqual(float(r[0]), 0.0, "免费模型单价必须是 0")
+
+    def test_pricing_is_idempotent(self):
+        with db(self.ccdb) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS model_pricing ("
+                      " model_id TEXT PRIMARY KEY, display_name TEXT,"
+                      " input_cost_per_million TEXT, output_cost_per_million TEXT,"
+                      " cache_read_cost_per_million TEXT,"
+                      " cache_creation_cost_per_million TEXT)")
+            n1 = hus.ensure_free_model_pricing(c)
+            n2 = hus.ensure_free_model_pricing(c)
+        self.assertEqual(n2, 0, "第二次不应再新增")
+        self.assertGreaterEqual(n1, 0)
 
 
 if __name__ == "__main__":

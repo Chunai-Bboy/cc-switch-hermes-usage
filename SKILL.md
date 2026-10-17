@@ -106,6 +106,24 @@ node "$sk\scripts\hermes-usage-panel.js" 8799
 - **明细**照实显示全部行，不过滤——CC Switch 的请求日志也是这样
   （早先版本两边都过滤，结果 opencode 详情直接变 0 条）
 
+## 已知失真与对策（2026-10-17 实测）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| token 数 / 请求数 | **准** | 账本与 CC Switch 逐维相等；账本 ≥ Hermes 真值是因为上游升级删过 10 个老会话，历史已安全保留 |
+| 成本 | **准** | 按 `model_pricing` 重算逐项一致；免费模型（space-bunny-free / upstage solar / nemotron）显式补 0 定价，语义从"未定价"变"已定价且免费" |
+| HTTP 状态 | **已修** | 聚合源证明不了状态，曾统一写 200 导致成功率恒 100%。现在每次 sync 用插件归档回填真实 `status_code`（实测揪出 1 条 401） |
+| 延迟 | **部分修** | 归档有 `duration_ms` 的按段回填中位数（实测 29 → 44 行有真值）；归档没覆盖的写 0 而不编造 |
+| 首次基线前的老数据 | 不可恢复 | 插件归档只覆盖 10-03，更早的调用无逐次记录 |
+
+### 回填怎么配对
+
+CC 行 `request_id` 里的 `@c<N>` 是同步那一刻的累计 `api_call_count`；归档
+`main` 事件 `event_id` 里的 `api:<n>` 是第 n 次调用。同一
+`(session, model, task)` 序列下按调用序号切段：
+第 i 个 CC 行覆盖 `(prev_c, c_i]` 这段调用。`status_code` 取段内首个错误码，
+`latency` 取段内 `duration_ms` 中位数。
+
 ## 计划任务（持续同步）
 
 ```powershell

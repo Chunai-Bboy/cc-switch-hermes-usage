@@ -362,6 +362,146 @@ def read_plugin_events(verbose=False):
     return events
 
 
+# ---------------------------------------------------------------- 归档回填
+# 背景（实测）：聚合源 session_model_usage 证明不了 HTTP 状态，write_deltas 统一写
+# 200，导致 CC Switch 里 Hermes 成功率恒为 100% —— 失真。而插件归档
+# （plugin-ledger-archive/*.sqlite）的 request_events 每条都有真实
+# status_code 与 duration_ms（实测 987 条、含 17 条 error/404/401）。
+#
+# 配对规则：CC 行 request_id 里的 @c<N> 是同步那一刻的累计 api_call_count；
+# 归档 main 事件 event_id 里的 api:<n> 是第 n 次调用。同一 (session, model,
+# task) 序列下，按调用序号把归档切段归属到各 CC 行：
+#     第 i 个 CC 行覆盖 (prev_c, c_i] 这段调用
+# status_code 取段内首个错误码（无错则 200）；latency 取段内 duration 中位数。
+
+ARCHIVE_DIR = os.path.expandvars(
+    r"%LOCALAPPDATA%\cc-switch-hermes-usage\plugin-ledger-archive")
+
+_RID = re.compile(r"^hermes:([^:]*):([^:]*):([^:]*):([^:]*):")
+_EID_MAIN = re.compile(r"^main:([^:]+):[^:]*:[^:]*:api:(\d+):")
+
+
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if not s:
+        return 0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) // 2
+
+
+def latest_archive_path():
+    """最新的插件归档（无则 None）。"""
+    d = os.path.normpath(ARCHIVE_DIR)
+    if not os.path.isdir(d):
+        return None
+    files = [f for f in os.listdir(d) if f.endswith(".sqlite")]
+    return os.path.join(d, sorted(files)[-1]) if files else None
+
+
+def backfill_status_from_archive(cc_conn, verbose=False):
+    """用插件归档的真实 status/duration 回填 hermes 明细。返回更新行数。
+
+    插件已卸载时归档是唯一能拿到真实 HTTP 状态的地方；没有归档就跳过
+    （不编造）。只更新 status_code 与 latency_ms，token/成本一律不动。
+    """
+    arc = latest_archive_path()
+    if not arc:
+        if verbose:
+            print("[backfill] 无插件归档，跳过")
+        return 0
+
+    ar = ro_connect(Path(arc))
+    if not table_exists(ar, "request_events"):
+        ar.close()
+        return 0
+
+    # 归档按 (session, model, task) 分组，组内按时间排序
+    ar_g = {}
+    for eid, sess, model, aux, ts, st, code, dur in ar.execute(
+            "SELECT event_id, session_id, model, aux_task, started_at_ms,"
+            " status, status_code, duration_ms FROM request_events"):
+        key = (sess, model, "") if _EID_MAIN.match(eid or "") else (
+            sess, model, aux or "")
+        ar_g.setdefault(key, []).append((ts or 0, st, code, dur or 0))
+    ar.close()
+    for k in ar_g:
+        ar_g[k].sort()
+
+    # CC 侧 hermes 明细按同一键分组
+    cc_g = {}
+    for rowid, rid, created in cc_conn.execute(
+            "SELECT rowid, request_id, created_at FROM proxy_request_logs"
+            " WHERE data_source=?", (DATA_SOURCE,)):
+        m = _RID.match(rid or "")
+        cn = re.search(r"@c(\d+):", rid or "")
+        if not (m and cn):
+            continue
+        cc_g.setdefault((m.group(2), m.group(3), m.group(4)), []).append(
+            (created, rowid, int(cn.group(1))))
+
+    updates = []
+    for key, rows in cc_g.items():
+        calls = ar_g.get(key)
+        if not calls:
+            continue
+        rows.sort()
+        prev = 0
+        for _created, rowid, cum in rows:
+            seg = calls[prev:cum] if cum <= len(calls) else calls[prev:]
+            prev = cum
+            if not seg:
+                continue
+            errs = [c for (_t, st, c, _d) in seg
+                    if st != "success" and isinstance(c, int) and c > 0]
+            new_sc = errs[0] if errs else 200
+            new_lat = _median([d for (_t, _s, _c, d) in seg if d > 0])
+            updates.append((new_sc, new_lat, rowid))
+
+    if not updates:
+        return 0
+    cc_conn.executemany(
+        "UPDATE proxy_request_logs SET status_code=?, latency_ms=? WHERE rowid=?",
+        updates)
+    if verbose:
+        n_err = sum(1 for (sc, _l, _r) in updates if not (200 <= sc < 300))
+        n_lat = sum(1 for (_s, l, _r) in updates if l > 0)
+        print("[backfill] 归档回填 %d 行（其中真实错误 %d 行、有耗时 %d 行）"
+              % (len(updates), n_err, n_lat))
+    return len(updates)
+
+
+# ---------------------------------------------------------------- 免费模型定价
+# CC Switch 对免费模型（如 longcat-2.5-preview-free）本来就记 in/out=0，
+# 但 zen 免费池的几个模型在 model_pricing 里连行都没有，UI 会显示"未定价"。
+# 显式补 0 行，让语义变成"已定价且免费"。
+FREE_MODELS = {
+    "space-bunny-free": "Space Bunny (free)",
+    "upstage/solar-pro4:free": "Upstage Solar Pro 4 (free)",
+    "nemotron-3-ultra-free": "Nemotron 3 Ultra (free)",
+}
+
+
+def ensure_free_model_pricing(cc_conn, verbose=False):
+    """给已知免费模型补显式 0 定价。返回新增行数。"""
+    if not table_exists(cc_conn, "model_pricing"):
+        return 0
+    n = 0
+    for mid, disp in FREE_MODELS.items():
+        ex = cc_conn.execute("SELECT 1 FROM model_pricing WHERE model_id=?",
+                             (mid,)).fetchone()
+        if ex:
+            continue
+        cc_conn.execute(
+            "INSERT INTO model_pricing (model_id, display_name,"
+            " input_cost_per_million, output_cost_per_million,"
+            " cache_read_cost_per_million, cache_creation_cost_per_million)"
+            " VALUES (?,?,?,?,?,?)", (mid, disp, "0", "0", "0", "0"))
+        n += 1
+        if verbose:
+            print("[pricing] 补免费定价: %s" % mid)
+    return n
+
+
 # ---------------------------------------------------------------- delta
 
 def series_key(r):
@@ -781,6 +921,7 @@ def main():
         state.close(); cc.close()
         return 0
 
+    backfilled = 0
     if args.dry_run:
         prev = {r[0] for r in state.execute("SELECT key FROM snapshots")}
         new = {series_key(r) for r in rows} - prev
@@ -815,6 +956,10 @@ def main():
         written = write_deltas(cc, deltas, latency_index(events),
                               dry=args.dry_run, verbose=args.verbose)
         if not args.dry_run:
+            # 聚合源写不出真实 HTTP 状态（统一 200），用插件归档回填；
+            # 同时给免费模型补显式 0 定价，避免 UI 显示"未定价"。
+            backfilled = backfill_status_from_archive(cc, args.verbose)
+            ensure_free_model_pricing(cc, args.verbose)
             save_snapshots(state, snaps)
             save_events(state, events)
             save_extra_dimensions(state, rows, args.verbose)
@@ -828,8 +973,9 @@ def main():
     elapsed = (time.perf_counter() - t0) * 1000
     state.close(); cc.close()
     print("OK 同步完成: 聚合增量 %d 条 (写入耗时 %.1fms), 累计快照 %d 条, "
-          "profile %d 个, 插件逐请求事件 %d 条已存 sidecar"
-          % (written, elapsed, len(rows), len(dbs), len(events)))
+          "profile %d 个, 插件逐请求事件 %d 条已存 sidecar, 归档回填 %d 行"
+          % (written, elapsed, len(rows), len(dbs), len(events),
+             backfilled))
     if r4.code == 41:
         print("WARN: %s（用 --repair-config 清理）" % r4.msg)
     return 0
