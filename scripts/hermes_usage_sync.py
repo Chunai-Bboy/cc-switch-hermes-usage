@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -849,6 +850,49 @@ def report(state_conn, events, cc_db):
 
 # ---------------------------------------------------------------- 主流程
 
+def panel_keepalive(verbose=False):
+    """用量面板（hermes-usage-panel.js，端口 8799）保活。
+
+    面板是 node 写的本地 HTTP 服务；计划任务注册需要管理员（实测
+    Register-ScheduledTask Access denied），而 HermesUsageSync 每 15 分钟
+    跑一次、用的是 InteractiveToken —— 所以把保活挂在这里：
+    端口没在听就拉起，死了最多 15 分钟就恢复。
+    """
+    import subprocess
+    import socket
+    panel_port = 8799
+    try:
+        with socket.create_connection(("127.0.0.1", panel_port),
+                                      timeout=2) as s:
+            pass
+        return
+    except OSError:
+        pass
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "hermes-usage-panel.js")
+    if not os.path.exists(script):
+        if verbose:
+            print("[panel] 找不到 %s，跳过保活" % script)
+        return
+    node = shutil.which("node")
+    if not node:
+        if verbose:
+            print("[panel] 找不到 node，跳过保活")
+        return
+    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen([node, script, str(panel_port)],
+                         cwd=os.path.dirname(script),
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         creationflags=flags)
+        if verbose:
+            print("[panel] 已拉起用量面板 (http://127.0.0.1:%d)" % panel_port)
+    except OSError as e:
+        if verbose:
+            print("[panel] 拉起失败: %s" % e)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Hermes -> CC Switch 用量同步 v2",
@@ -978,6 +1022,7 @@ def main():
              backfilled))
     if r4.code == 41:
         print("WARN: %s（用 --repair-config 清理）" % r4.msg)
+    panel_keepalive(args.verbose)
     return 0
 
 
