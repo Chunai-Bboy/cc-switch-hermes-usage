@@ -99,12 +99,16 @@ node "$sk\scripts\hermes-usage-panel.js" 8799
 - 每日趋势柱状图、按模型表、最近 200 条明细
 - 只读 `~/.cc-switch/cc-switch.db`，15 秒自动刷新
 
-口径注意（与 CC Switch 对齐，实测踩过）：
-- **汇总**（图标栏/卡片）必须排除 `session_log / codex_session /
-  gemini_session / opencode_session` 这些 data_source，因为它们与 CC Switch
-  自己的 proxy 日志重复，不排除会把 opencode 从 121 次算成 242 次
-- **明细**照实显示全部行，不过滤——CC Switch 的请求日志也是这样
-  （早先版本两边都过滤，结果 opencode 详情直接变 0 条）
+口径注意（两条都是实测踩出来的，曾写反过）：
+
+- **汇总不过滤 data_source**。CC Switch 的 `effective_usage_log_filter`
+  是**条件式**去重：仅当同 app_type 下确有 proxy 行时才排除会话明细。
+  本机 opencode 的 proxy 行数 = 0，照抄规则会把 18,619 行明细全排掉
+  （图标栏显示 opencode 0 次）。真正防双算由 CC Switch 自己的
+  `rollup_and_prune` 负责——它归档后会把明细删掉，我们只 INSERT 不 DELETE，
+  不会重叠。
+- **图标栏必须显示全部 8 个 app**，没有用量的记 0。早期只返回有数据的 app，
+  结果 7d 范围下只剩 Hermes 一个图标，用户看不到别的、点了也没反应。
 
 ## 已知失真与对策（2026-10-17 实测）
 

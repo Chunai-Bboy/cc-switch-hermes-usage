@@ -31,16 +31,34 @@ const HAS_PY = fs.existsSync(PY);
 // UI 单独一个文件，避免本文件过长难维护
 const { renderHTML } = require("./hermes-usage-panel-ui.js");
 
-/** 与 usage_stats.rs 的 by_app 同口径 */
+/**
+ * 汇总口径。
+ *
+ * 早先照抄了 CC Switch 的防双算规则（排除 opencode_session 等 data_source），
+ * 但那是**条件式**的：仅当同 app_type 下确有 proxy 行时才需要排除。
+ * 实测本机 opencode 的 proxy 行数 = 0，这条规则把 18,619 行明细全排掉了，
+ * 图标栏显示 opencode 0 次。故不过滤，直接按 app_type 聚合。
+ *
+ * 真正需要防的是 CC Switch 自己 prune 后 rollup 与明细重叠 —— 那由
+ * CC Switch 的 rollup_and_prune 保证（它删掉被归档的明细），我们这边
+ * 只加不删，不会双算。
+ */
 const SQL_BY_APP = `
-SELECT app_type,
-       SUM(reqs)  AS reqs,
-       SUM(cost)  AS cost,
-       SUM(inp)   AS input,
-       SUM(oup)   AS output,
-       SUM(cr)    AS cache_read,
-       SUM(cc)    AS cache_creation
-FROM (
+SELECT a.app_type,
+       COALESCE(x.reqs, 0) AS reqs,
+       COALESCE(x.cost, 0) AS cost,
+       COALESCE(x.input,0) AS input,
+       COALESCE(x.output,0) AS output,
+       COALESCE(x.cache_read,0) AS cache_read,
+       COALESCE(x.cache_creation,0) AS cache_creation
+FROM (SELECT 'claude' AS app_type UNION ALL SELECT 'codex'
+      UNION ALL SELECT 'gemini' UNION ALL SELECT 'grokbuild'
+      UNION ALL SELECT 'opencode' UNION ALL SELECT 'hermes'
+      UNION ALL SELECT 'pi' UNION ALL SELECT 'mcode') a
+LEFT JOIN (
+  SELECT app_type, SUM(reqs) reqs, SUM(cost) cost, SUM(inp) input,
+         SUM(oup) output, SUM(cr) cache_read, SUM(cc) cache_creation
+  FROM (
   SELECT CASE WHEN l.app_type='claude-desktop' THEN 'claude' ELSE l.app_type END AS app_type,
          COUNT(*) AS reqs,
          COALESCE(SUM(CAST(l.total_cost_usd AS REAL)),0) AS cost,
@@ -50,8 +68,6 @@ FROM (
          COALESCE(SUM(l.cache_creation_tokens),0) AS cc
   FROM proxy_request_logs l
   WHERE l.created_at >= :s AND l.created_at <= :e
-    AND NOT (COALESCE(l.data_source,'proxy') IN
-             ('session_log','codex_session','gemini_session','opencode_session'))
   GROUP BY 1
   UNION ALL
   SELECT CASE WHEN r.app_type='claude-desktop' THEN 'claude' ELSE r.app_type END,
@@ -64,15 +80,13 @@ FROM (
   FROM usage_daily_rollups r
   WHERE r.date >= :ds AND r.date <= :de
   GROUP BY 1
-) GROUP BY app_type ORDER BY reqs DESC`;
+  ) GROUP BY app_type
+) x ON x.app_type = a.app_type
+ORDER BY reqs DESC, a.app_type`;
 
 /**
- * 防双算规则只用于【汇总】（/api/apps）：CC Switch 自己的 proxy 日志
- * (data_source='proxy') 与会话明细会重复，Hero 总数必须排除其中一份，
- * 否则 opencode 这类会被算两遍（实测 121 次翻成 242 次）。
- *
- * 但【明细/日志表】照实显示全部行 —— CC Switch 的请求日志就是这么做的
- * （用户截图里 opencode 明细正常列出）。所以详情接口不带这个过滤。
+ * 详情接口：照实显示该 app 在时间范围内的全部明细行，不做任何过滤。
+ * CC Switch 的请求日志也是这样（用户截图里 opencode 明细正常列出）。
  */
 const SQL_APP_DAYS = `
 SELECT date(created_at,'unixepoch','localtime') AS d,
