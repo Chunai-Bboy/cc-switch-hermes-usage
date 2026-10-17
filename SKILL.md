@@ -24,32 +24,56 @@ compatibility: opencode
 | 本地是否有查看模型用量的工具？ | 有。数据源即 Hermes state.db（`sessions`/`session_model_usage` 表）；目标展示即 CC Switch 使用统计页；Hermes 桌面版另有 `settings?tab=billing` 可交叉核对 |
 | Hermes 出现在页面哪个位置？ | **使用统计页 App 筛选按钮行有独立 "Hermes" 按钮**（本地构建补齐），叠加 `全部来源` 下拉的 "Hermes Agent" 项。日期范围需覆盖数据日期（默认"当天"不显示历史数据） |
 
-## 本地构建记录（Hermes App 按钮）
+## 本地构建记录（用量页的 Hermes 图标）
 
-CC Switch 3.20.4 发布版前端不含 Hermes 按钮（`KNOWN_APP_TYPES` 无 hermes）。已从源码构建补齐：
+发布版把 hermes 排除在用量页筛选行之外：`KNOWN_APP_TYPES` 不含 hermes，
+且上游注释写明是**有意设计**（"hermes/openclaw 只作为被管理的应用出现在别处"）。
+后端其实早就支持——`get_usage_summary_by_app` 直接返回 `appType=hermes`，
+所以缺的只有前端白名单里那一行。
+
+**⚠ 两个反复踩的坑：**
+1. **CC Switch 会自动更新**（本会话内 4.0.10 → 4.0.12 无人干预）。官方更新会
+   直接覆盖 `cc-switch.exe`，**补丁随之失效、图标消失**。用户报"图标又没了"时
+   先查版本号，别先查数据。彻底避免需关掉应用内自动更新，否则每次更新重打一次。
+2. **别用"页面里搜不到字样"判断**：侧栏本来就有 Hermes（被管理的应用），
+   搜字会误判成"已支持"。必须精确定位到**用量页那条筛选行**再数按钮。
+   验证方法（唯一可靠，已沉淀）：
+   ```powershell
+   # 带调试端口启动，再用 CDP 读真实 DOM
+   $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9225"
+   Start-Process "D:\ai\cc-switch.exe"
+   # node + WebSocket 连 http://127.0.0.1:9225/json 的 page，
+   # Runtime.evaluate 取 button[aria-label] 列表；
+   # 还能 fetch 自己页面加载的 bundle，确认 exe 内嵌的到底是哪份前端。
+   ```
+
+### 4.0.12 构建（2026-10-17，当前生效）
 
 | 项 | 值 |
 |---|---|
-| 源码 | `D:\security-research\projects\cc-switch`（main = 3.20.4） |
-| 改动 | `src/types/usage.ts`（AppType + KNOWN_APP_TYPES 加 hermes）、`UsageDashboard.tsx`（APP_FILTER_ICON）、`UsageHero.tsx`（TITLE_THEMES 配色）、4 个 i18n locale 加 `usage.appFilter.hermes` |
-| 未改动 | 后端 Rust（3.20.4 原生已支持 `app_type='hermes'` 聚合查询，数据仍由本 skill 同步写入） |
-| 产物 | `src-tauri\target\release\cc-switch.exe` → 安装到 `D:\ai\cc-switch.exe` |
-| 备份 | `D:\ai\cc-switch.exe.bak-3.20.4-original` |
-| 构建环境 | Rust **1.95**（仓库 `rust-toolchain.toml` 固定，需 USTC 镜像 `RUSTUP_DIST_SERVER`）、MSVC 2022 BuildTools、pnpm |
+| 源码 | `D:\GitHub\cc-switch-fork` = 官方 tag `v4.0.12`，**tar.gz 下载**（git 协议在本机网络会挂死，codeload 可用） |
+| 改动 | **只有 `src/types/usage.ts` 两处**：`AppType` 联合加 `\| "hermes"`、`KNOWN_APP_TYPES` 在 `"opencode"` 后加 `"hermes"` |
+| 比 3.20.4 少改哪些 | 4.0.12 图标行改用 `AppGlyph` + `APP_DISPLAY_NAME`（品牌名不翻译，已含 hermes/图标资产），且 `UsageHero` 已无 `TITLE_THEMES`、chips 不再走 `usage.appFilter.*` 翻译 —— **i18n 与两个组件都不用改** |
+| 刻意不改 | `CACHE_INCLUSIVE_APP_TYPES` / `PARTIAL_CACHE_WRITE_APP_TYPES`。Hermes 的 `input_tokens` 本就是非缓存口径（实测 input 8.1M < cache_read 135M），误入白名单会被减成负数 |
+| 后端 | 未动（Rust 原生按 app_type 聚合） |
+| 产物/安装 | `src-tauri\target\release\cc-switch.exe`(41.5MB) → `D:\ai\cc-switch.exe`，SHA256 一致 |
+| 回退 | `D:\ai\cc-switch.exe.bak-v4.0.12`（官方版）；更早还有 `.bak-3.20.4-original` |
+| 环境 | rustup/cargo **1.98.1 stable**（`rustup-init -y --profile minimal`，装完须把 `%USERPROFILE%\.cargo\bin` 塞进 PATH，否则后台 `pnpm tauri build` 报 `cargo program not found`）；pnpm **10.12.3**（corepack 会挂死，用 `npm i -g pnpm@10.12.3`）；MSVC BuildTools 2022 + Windows SDK 26100 本机已有（`vswhere -latest` 返回空是假阴性，直接找 `link.exe`） |
+| 网络 | crates 用 rsproxy（`~\.cargo\config.toml`）、npm 用 npmmirror；`pnpm tauri build --no-bundle` 全量 ~8 分钟 |
 
-复现构建（注意国内网络）：
+复现：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-$env:RUSTUP_DIST_SERVER = "https://mirrors.ustc.edu.cn/rust-static"   # 关键：否则拉 1.95 工具链会挂起
-$env:RUSTUP_UPDATE_ROOT = "https://mirrors.ustc.edu.cn/rust-static/rustup"
-cd D:\security-research\projects\cc-switch
-pnpm install
-pnpm tauri build --no-bundle     # 产物 src-tauri\target\release\cc-switch.exe
+cd D:\GitHub\cc-switch-fork
+pnpm install --registry https://registry.npmmirror.com
+pnpm typecheck            # AppType 是穷举类型，漏改会被 tsc 拦下
+pnpm tauri build --no-bundle
 ```
 
-> 未移植 PR #6120 的 `session_usage_hermes.rs`（原生 Rust 同步 + 残差对账）。原因：涉及 6+ 文件、上千 hunks，
-> 而数据链路已由本 skill 打通且验证通过。合入后可将本 skill 降级为"仅验证"。
+> 3.20.4 时代的构建在 `D:\security-research\projects\cc-switch`（改过
+> `APP_FILTER_ICON`/`TITLE_THEMES`/4 个 locale），已被 4.0.12 的 2 行方案取代。
+> 仍未移植 PR #6120 的 `session_usage_hermes.rs`；若上游合入，本 skill 可降级为"仅验证"。
 
 ## v2（2026-10-03）
 
