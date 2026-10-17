@@ -42,6 +42,7 @@ Invoke-RestMethod http://127.0.0.1:9222/json   # 取 webSocketDebuggerUrl
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 偏大（约 2 倍或倍数增长） | 旧版全量脚本 + 新脚本 delta 双计 | 仅此情形用 `--reset-baseline`（先备份两个 db） |
+| 某 app 用量整块变 0 | 照抄了 CC Switch `effective_usage_log_filter` 的 data_source 排除清单，但它是**条件式**的：仅当同 app_type 确有 proxy 行时才排除会话明细（实测本机 opencode proxy 行=0，盲抄会排掉 1.8 万行） | 自己聚合时不要无条件排除会话明细；防双算由 CC Switch 的 `rollup_and_prune`（归档即删明细）负责 |
 | verify 报 WARN「上游丢历史」 | Hermes 升级/清理删了老会话聚合行，属常态 | **不用处理**。CC==账本分毫不差即健康；别 reset |
 | 偏小 | 计数器重置把中间量当基线丢了 | 已知限制（cumulative 源无逐次事件）；可对比 Hermes 桌面版 billing 页人工核对 |
 | 成本全 0 或"未定价" | model_pricing 无该模型 | 在 usage 页"成本定价"里补价，下次同步兜底计算生效 |

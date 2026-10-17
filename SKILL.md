@@ -83,51 +83,6 @@ python $sk\scripts\verify_hermes_usage.py
 python $sk\scripts\hermes_usage_sync.py --reset-baseline
 ```
 
-## 用量面板（不想翻 CC Switch 时用它）
-
-CC Switch 4.0.12 前端已 Rust 重写、本机无 cargo 无法改源码重编，所以另做了一个
-独立面板：同样的库、同样的口径，点 app 图标即看该 app 用量。
-
-```powershell
-node "$sk\scripts\hermes-usage-panel.js" 8799
-# 浏览器开 http://127.0.0.1:8799
-```
-
-- 顶部一排 app 图标（Claude/Codex/Gemini/Grok/OpenCode/**Hermes**/Pi/MCode），
-  每个图标下面直接标请求数和成本，点一下即切换
-- 卡片区：总请求数 / 真实消耗 Tokens / 缓存命中 / 总成本 / 活跃天数 / 模型数
-- 每日趋势柱状图、按模型表、最近 200 条明细
-- 只读 `~/.cc-switch/cc-switch.db`，15 秒自动刷新
-
-口径注意（两条都是实测踩出来的，曾写反过）：
-
-- **汇总不过滤 data_source**。CC Switch 的 `effective_usage_log_filter`
-  是**条件式**去重：仅当同 app_type 下确有 proxy 行时才排除会话明细。
-  本机 opencode 的 proxy 行数 = 0，照抄规则会把 18,619 行明细全排掉
-  （图标栏显示 opencode 0 次）。真正防双算由 CC Switch 自己的
-  `rollup_and_prune` 负责——它归档后会把明细删掉，我们只 INSERT 不 DELETE，
-  不会重叠。
-- **图标栏必须显示全部 8 个 app**，没有用量的记 0。早期只返回有数据的 app，
-  结果 7d 范围下只剩 Hermes 一个图标，用户看不到别的、点了也没反应。
-
-## 已知失真与对策（2026-10-17 实测）
-
-| 项 | 状态 | 说明 |
-|---|---|---|
-| token 数 / 请求数 | **准** | 账本与 CC Switch 逐维相等；账本 ≥ Hermes 真值是因为上游升级删过 10 个老会话，历史已安全保留 |
-| 成本 | **准** | 按 `model_pricing` 重算逐项一致；免费模型（space-bunny-free / upstage solar / nemotron）显式补 0 定价，语义从"未定价"变"已定价且免费" |
-| HTTP 状态 | **已修** | 聚合源证明不了状态，曾统一写 200 导致成功率恒 100%。现在每次 sync 用插件归档回填真实 `status_code`（实测揪出 1 条 401） |
-| 延迟 | **部分修** | 归档有 `duration_ms` 的按段回填中位数（实测 29 → 44 行有真值）；归档没覆盖的写 0 而不编造 |
-| 首次基线前的老数据 | 不可恢复 | 插件归档只覆盖 10-03，更早的调用无逐次记录 |
-
-### 回填怎么配对
-
-CC 行 `request_id` 里的 `@c<N>` 是同步那一刻的累计 `api_call_count`；归档
-`main` 事件 `event_id` 里的 `api:<n>` 是第 n 次调用。同一
-`(session, model, task)` 序列下按调用序号切段：
-第 i 个 CC 行覆盖 `(prev_c, c_i]` 这段调用。`status_code` 取段内首个错误码，
-`latency` 取段内 `duration_ms` 中位数。
-
 ## 计划任务（持续同步）
 
 ```powershell
