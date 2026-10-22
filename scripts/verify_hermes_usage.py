@@ -176,6 +176,46 @@ def lost_sessions(ledger, truth_series):
                   key=lambda kv: -kv[1])
 
 
+def _aux_archive_evidence():
+    """插件归档里可佐证的耗时来源：
+      aux_pairs      —— (session_id, aux_task) 且有 duration>0 的辅助事件
+      main_sessions  —— 有 duration>0 主循环事件的 session（background_review
+                        走同一条 conversation_loop 路径，由主循环钩子观测）
+    无归档/无表时返回两个空集合。"""
+    import glob
+    aux_pairs, main_sessions = set(), set()
+    d = os.path.join(os.path.dirname(HERMES_HOME), "cc-switch-hermes-usage",
+                     "plugin-ledger-archive")
+    files = sorted(glob.glob(os.path.join(d, "*.sqlite")))
+    if not files:
+        return aux_pairs, main_sessions
+    try:
+        with closing(ro(files[-1])) as lg:
+            if not lg.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                              " AND name='request_events'").fetchone():
+                return set(), set()
+            for kind, sess, aux in lg.execute(
+                    "SELECT DISTINCT kind, session_id, aux_task FROM request_events"
+                    " WHERE duration_ms > 0"):
+                if not sess:
+                    continue
+                if kind == "aux":
+                    aux_pairs.add((sess, aux or ""))
+                else:
+                    main_sessions.add(sess)
+    except sqlite3.Error:
+        return set(), set()
+    return aux_pairs, main_sessions
+
+
+def _rid_session_task(request_id):
+    """hermes:profile:session:model:task:... -> (session, task)"""
+    parts = (request_id or "").split(":")
+    if len(parts) < 5:
+        return ("", "")
+    return (parts[2], parts[4])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Hermes → CC Switch 同步验收")
     ap.add_argument("--cc-db", default=os.path.expanduser(r"~\.cc-switch\cc-switch.db"))
@@ -203,12 +243,17 @@ def main():
 
     # ---------------------------------------------------------- 1. provider
     with closing(ro(args.cc_db)) as cc:
-        pv = cc.execute("SELECT name FROM providers WHERE id=? AND app_type=?",
-                        (PROVIDER_ID, APP_TYPE)).fetchone()
-        if pv:
-            c.ok("provider 注册", pv[0])
+        ghost = cc.execute(
+            "SELECT COUNT(*) FROM providers WHERE id=? AND app_type=?",
+            (PROVIDER_ID, APP_TYPE)).fetchone()[0]
+        if ghost:
+            # 伪 provider 行会让 CC Switch 的 Hermes 应用页多一张幽灵卡片，
+            # sync 会自动清理；这里报出来只是为了可见。
+            c.warn("伪 provider 行",
+                   "%d 条（跑一次 sync 清理；用量显示名应由 CC Switch 的"
+                   " provider_name_coalesce 提供）" % ghost)
         else:
-            c.bad("provider 注册", "缺失，先跑 hermes_usage_sync.py")
+            c.ok("伪 provider 行", "无（用量显示名由 CC Switch 的 session 映射提供）")
 
         # ------------------------------------------------- 2. 记录存在性
         agg = cc.execute(
@@ -347,12 +392,29 @@ def main():
                 "SELECT request_id, latency_ms FROM proxy_request_logs"
                 " WHERE data_source=? AND latency_ms>0", (DATA_SOURCE,)):
             lat_by_task[r[0]] = r[1]
-        aux_lat = [v for k, v in lat_by_task.items()
-                   if ":title_generation:" in k or ":approval:" in k
-                   or ":background_review:" in k]
-        if aux_lat:
-            c.bad("latency 归属",
-                  "%d 条辅助任务行带了耗时（应恒为 0，辅助调用无 hook 观测）" % len(aux_lat))
+        aux_keys = [k for k in lat_by_task
+                    if ":title_generation:" in k or ":approval:" in k
+                    or ":background_review:" in k or ":compression:" in k
+                    or ":vision:" in k or ":moa:" in k]
+        if aux_keys:
+            # aux 行有 latency 的唯一合法来源：插件归档里的 aux 事件
+            # （post_auxiliary_call 自 0.21.5 起提供）。无归档可佐证 = 编数。
+            aux_pairs, main_sessions = _aux_archive_evidence()
+            legit, bogus = [], []
+            for k in aux_keys:
+                sess, task = _rid_session_task(k)
+                if (sess, task) in aux_pairs or (task == "background_review"
+                                                 and sess in main_sessions):
+                    legit.append(k)
+                else:
+                    bogus.append(k)
+            if bogus:
+                c.bad("latency 归属",
+                      "%d 条辅助任务行带了无归档佐证的耗时（应恒为 0；"
+                      "回填只可信于插件归档里的 aux 事件）" % len(bogus))
+            elif legit:
+                c.ok("latency 归属",
+                     "%d 条辅助任务行的耗时来自插件归档 aux 事件（合法）" % len(legit))
         elif lat_by_task:
             c.ok("latency 归属",
                  "%d 条主循环行有真实耗时，辅助任务行均为 0" % len(lat_by_task))

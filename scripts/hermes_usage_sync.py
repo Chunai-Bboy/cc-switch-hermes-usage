@@ -671,13 +671,23 @@ def median(xs):
 
 # ---------------------------------------------------------------- 写入
 
-def ensure_provider(cc_conn):
-    cc_conn.execute(
-        "INSERT OR IGNORE INTO providers (id, app_type, name, settings_config)"
-        " VALUES (?, ?, ?, '{}')", (PROVIDER_ID, APP_TYPE, PROVIDER_NAME))
-    cc_conn.execute(
-        "UPDATE providers SET name = ? WHERE id = ? AND app_type = ? AND name IS NOT ?",
-        (PROVIDER_NAME, PROVIDER_ID, APP_TYPE, PROVIDER_NAME))
+def ensure_provider(cc_conn, verbose=False):
+    """清理历史遗留的伪 provider 行（并停止插入）。
+
+    早期版本会 INSERT '_hermes_session'/'Hermes Agent' 进 providers 表，用来给
+    用量页一个可读的供应商名。副作用：CC Switch 把这条没有 base_url 的行渲染成
+    Hermes 应用「可添加」分组里的幽灵卡片。上游对 _mcode_session/_agy_session
+    的做法是不建 providers 行、改由 usage_stats.rs 的 provider_name_coalesce
+    CASE 提供显示名；打补丁的 fork 已为 '_hermes_session' 加上同一分支。
+    因此这里只删不插；未打补丁的官方 CC Switch 上，用量页会退回显示裸 id
+    '_hermes_session'（数据不受影响）。
+    """
+    cur = cc_conn.execute(
+        "DELETE FROM providers WHERE id = ? AND app_type = ?",
+        (PROVIDER_ID, APP_TYPE))
+    if verbose and cur.rowcount:
+        print("[provider] 清理伪 provider 行 %d 条"
+              "（用量显示名改由 CC Switch 的 session 映射提供）" % cur.rowcount)
 
 
 def make_request_id(row):
@@ -952,7 +962,7 @@ def main():
     t0 = time.perf_counter()
     try:
         cc.execute("BEGIN IMMEDIATE")
-        ensure_provider(cc)
+        ensure_provider(cc, args.verbose)
         written = write_deltas(cc, deltas, latency_index(events),
                               dry=args.dry_run, verbose=args.verbose)
         if not args.dry_run:

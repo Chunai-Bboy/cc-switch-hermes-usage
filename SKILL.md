@@ -24,56 +24,76 @@ compatibility: opencode
 | 本地是否有查看模型用量的工具？ | 有。数据源即 Hermes state.db（`sessions`/`session_model_usage` 表）；目标展示即 CC Switch 使用统计页；Hermes 桌面版另有 `settings?tab=billing` 可交叉核对 |
 | Hermes 出现在页面哪个位置？ | **使用统计页 App 筛选按钮行有独立 "Hermes" 按钮**（本地构建补齐），叠加 `全部来源` 下拉的 "Hermes Agent" 项。日期范围需覆盖数据日期（默认"当天"不显示历史数据） |
 
-## 本地构建记录（用量页的 Hermes 图标）
+## 本地构建记录（用量页的 Hermes 图标 + 供应商名）
 
 发布版把 hermes 排除在用量页筛选行之外：`KNOWN_APP_TYPES` 不含 hermes，
-且上游注释写明是**有意设计**（"hermes/openclaw 只作为被管理的应用出现在别处"）。
-后端其实早就支持——`get_usage_summary_by_app` 直接返回 `appType=hermes`，
-所以缺的只有前端白名单里那一行。
+上游注释写明是**有意设计**（"hermes/openclaw 只作为被管理的应用出现在别处"）。
+后端早就支持——`get_usage_summary_by_app` 直接返回 `appType=hermes`，
+缺的只有前端白名单那一行。
 
-**⚠ 两个反复踩的坑：**
-1. **CC Switch 会自动更新**（本会话内 4.0.10 → 4.0.12 无人干预）。官方更新会
-   直接覆盖 `cc-switch.exe`，**补丁随之失效、图标消失**。用户报"图标又没了"时
-   先查版本号，别先查数据。彻底避免需关掉应用内自动更新，否则每次更新重打一次。
+另有一条历史包袱：早期本 skill 会往 `providers` 表插 `_hermes_session`
+/`Hermes Agent` 伪记录，好让用量页有可读供应商名。副作用是 CC Switch 把它
+渲染成 Hermes 应用页「可添加」分组里的**幽灵卡片**（用户看到的"两个 Hermes"）。
+上游对 mcode/agy 的做法是不建 providers 行、由 `usage_stats.rs` 的
+`provider_name_coalesce` CASE 给显示名 —— 现已照此改造。
+
+### 三处补丁（`scripts/apply_fork_patch.py` 一键重放）
+
+| # | 文件 | 改动 | 解决 |
+|---|---|---|---|
+| 1 | `src/types/usage.ts` | `AppType` 与 `KNOWN_APP_TYPES` 各加 `"hermes"` | 用量页筛选行出现 Hermes 图标 |
+| 2 | `src-tauri/src/services/usage_stats.rs` | `provider_name_coalesce` 的 CASE 加 `'_hermes_session' THEN 'Hermes (Session)'` | 供应商列显示可读名，不是裸 id |
+| 3 | `src/components/usage/providerLabel.ts` | `SESSION_PROVIDER_APPS` 加 `"Hermes (Session)": "hermes"` | 供应商筛选下拉能折叠到 Hermes |
+
+```powershell
+# 对新下载的源码一键重放（幂等；--verify 只检查不改写）
+python scripts\apply_fork_patch.py D:\GitHub\cc-switch-vXXXX --verify
+python scripts\apply_fork_patch.py D:\GitHub\cc-switch-vXXXX
+```
+
+> 脚本用正则锚定上游原文，**已验证：干净 v4.0.18 源码重放后与手工补丁逐字节一致**。
+> 上游若重构这三个位置，脚本会 assert 失败并提示"需要人工更新"，不会静默写坏。
+
+**⚠ 三个反复踩的坑：**
+1. **CC Switch 会自动更新**（本会话内 4.0.10 → 4.0.12 → 4.0.18 无人干预）。
+   官方更新直接覆盖 `cc-switch.exe`，**补丁失效、图标消失**。用户报"图标又没了"
+   时先查版本号，别查数据。要么关掉应用内自动更新，要么每次更新重跑上面的脚本。
 2. **别用"页面里搜不到字样"判断**：侧栏本来就有 Hermes（被管理的应用），
    搜字会误判成"已支持"。必须精确定位到**用量页那条筛选行**再数按钮。
-   验证方法（唯一可靠，已沉淀）：
-   ```powershell
-   # 带调试端口启动，再用 CDP 读真实 DOM
-   $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9225"
-   Start-Process "D:\ai\cc-switch.exe"
-   # node + WebSocket 连 http://127.0.0.1:9225/json 的 page，
-   # Runtime.evaluate 取 button[aria-label] 列表；
-   # 还能 fetch 自己页面加载的 bundle，确认 exe 内嵌的到底是哪份前端。
-   ```
+   验证方式：带 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9226"`
+   启动，用 node+WebSocket 连 `http://127.0.0.1:9226/json` 的 page，
+   `Runtime.evaluate` 取筛选行（`div[aria-label="应用"]`）里的按钮文字。
+   4.0.18 起筛选行是**文字标签**（OpenCodeOpenCode / Hermes / MinimaxMiniMax Code / Antigravity），不再是纯图标。
+3. **Rust 侧字符串转义**：往 `provider_name_coalesce` 的 CASE 里加分支时，行尾必须是
+   单个反斜杠（Rust 续行）。多写一个反斜杠或双引号会让 SQL 里混进游离字符 ——
+   编译能过但查询坏。脚本已用动态缩进 + 显式字面量避开这个坑。
 
-### 4.0.12 构建（2026-10-17，当前生效）
+### 4.0.18 构建（2026-10-22，当前生效）
 
 | 项 | 值 |
 |---|---|
-| 源码 | `D:\GitHub\cc-switch-fork` = 官方 tag `v4.0.12`，**tar.gz 下载**（git 协议在本机网络会挂死，codeload 可用） |
-| 改动 | **只有 `src/types/usage.ts` 两处**：`AppType` 联合加 `\| "hermes"`、`KNOWN_APP_TYPES` 在 `"opencode"` 后加 `"hermes"` |
-| 比 3.20.4 少改哪些 | 4.0.12 图标行改用 `AppGlyph` + `APP_DISPLAY_NAME`（品牌名不翻译，已含 hermes/图标资产），且 `UsageHero` 已无 `TITLE_THEMES`、chips 不再走 `usage.appFilter.*` 翻译 —— **i18n 与两个组件都不用改** |
-| 刻意不改 | `CACHE_INCLUSIVE_APP_TYPES` / `PARTIAL_CACHE_WRITE_APP_TYPES`。Hermes 的 `input_tokens` 本就是非缓存口径（实测 input 8.1M < cache_read 135M），误入白名单会被减成负数 |
-| 后端 | 未动（Rust 原生按 app_type 聚合） |
-| 产物/安装 | `src-tauri\target\release\cc-switch.exe`(41.5MB) → `D:\ai\cc-switch.exe`，SHA256 一致 |
-| 回退 | `D:\ai\cc-switch.exe.bak-v4.0.12`（官方版）；更早还有 `.bak-3.20.4-original` |
-| 环境 | rustup/cargo **1.98.1 stable**（`rustup-init -y --profile minimal`，装完须把 `%USERPROFILE%\.cargo\bin` 塞进 PATH，否则后台 `pnpm tauri build` 报 `cargo program not found`）；pnpm **10.12.3**（corepack 会挂死，用 `npm i -g pnpm@10.12.3`）；MSVC BuildTools 2022 + Windows SDK 26100 本机已有（`vswhere -latest` 返回空是假阴性，直接找 `link.exe`） |
-| 网络 | crates 用 rsproxy（`~\.cargo\config.toml`）、npm 用 npmmirror；`pnpm tauri build --no-bundle` 全量 ~8 分钟 |
+| 源码 | `D:\GitHub\cc-switch-v4018` = 官方 tag `v4.0.18`，**codeload tar.gz 下载**（git 协议在本机网络会挂死） |
+| 上游新增 | `AppType` 多了 `"agy"`（Antigravity）；`KNOWN_APP_TYPES` 同步 —— 重放脚本按 `"opencode"` 之后插入，不受影响 |
+| 刻意不改 | `CACHE_INCLUSIVE_APP_TYPES` / `PARTIAL_CACHE_WRITE_APP_TYPES`。Hermes 的 `input_tokens` 本就是非缓存口径（input 8.1M < cache_read 135M），误入会被减成负数 |
+| 产物/安装 | `src-tauri\target\release\cc-switch.exe`(42.6MB) → `D:\ai\cc-switch.exe` |
+| 回退 | `D:\ai\cc-switch.exe.bak-v4.0.18-original`（官方版） |
+| 环境 | cargo 1.98.1 / pnpm 10.12.3 / MSVC BuildTools 2022 + SDK 26100；后台构建必须把 `%USERPROFILE%\.cargo\bin` 塞进 PATH |
+| 网络 | **crates 源用 rsproxy**（`~/.cargo/config.toml`，USTC 镜像当时已挂）；npm 用 npmmirror；全量编译约 4.5 分钟 |
 
 复现：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-cd D:\GitHub\cc-switch-fork
+cd D:\GitHub\cc-switch-v4018
+python scripts\apply_fork_patch.py .
 pnpm install --registry https://registry.npmmirror.com
 pnpm typecheck            # AppType 是穷举类型，漏改会被 tsc 拦下
 pnpm tauri build --no-bundle
 ```
 
-> 3.20.4 时代的构建在 `D:\security-research\projects\cc-switch`（改过
-> `APP_FILTER_ICON`/`TITLE_THEMES`/4 个 locale），已被 4.0.12 的 2 行方案取代。
-> 仍未移植 PR #6120 的 `session_usage_hermes.rs`；若上游合入，本 skill 可降级为"仅验证"。
+> PR #6120 的 `session_usage_hermes.rs` 仍未合入（4.0.18 的 `sync_all_unlocked`
+> 只有 Claude/Codex/Gemini/OpenCode/Grok/Pi/MCode/Antigravity，**没有 Hermes**），
+> 所以本 skill 自己写 `proxy_request_logs` 不会双算。若上游合入，本 skill 可降级为"仅验证"。
 
 ## v2（2026-10-03）
 

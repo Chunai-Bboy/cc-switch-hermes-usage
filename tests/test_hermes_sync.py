@@ -110,11 +110,15 @@ def test_baseline_and_delta():
         r = run_sync(tmp, cc, st)
         assert totals(cc) == (2, 260, 30), totals(cc)
 
-        # provider 注册
+        # 伪 provider 行不应存在（用量显示名由 CC Switch 的 provider_name_coalesce 提供）
         c = sqlite3.connect(cc)
         name = c.execute("SELECT name FROM providers WHERE id='_hermes_session'").fetchone()
+        # 明细行照旧带 provider_id，供 CASE 映射与按供应商聚合
+        pid = c.execute("SELECT DISTINCT provider_id FROM proxy_request_logs"
+                        " WHERE data_source='hermes_session'").fetchall()
         c.close()
-        assert name == ("Hermes Agent",), name
+        assert name is None, ("伪 provider 行没被清理:", name)
+        assert pid == [("_hermes_session",)], pid
         print("PASS baseline_and_delta")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
